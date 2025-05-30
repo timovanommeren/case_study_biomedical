@@ -1,0 +1,14 @@
+---
+title: "case_study_biomedical"
+output: html_document
+date: "2025-05-30"
+---
+
+```{r setup, include=FALSE}
+
+library(foreign)
+
+data <- read.spss("data_ALS.sav")
+
+```
+
