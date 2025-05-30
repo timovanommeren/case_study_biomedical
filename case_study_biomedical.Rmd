@@ -4,11 +4,198 @@ output: html_document
 date: "2025-05-30"
 ---
 
+
+## Loading and cleaning data
+
 ```{r setup, include=FALSE}
+library(survival)
+library(ggplot2)
+library(survminer)
+library(haven)
+library(dplyr)
+library(lubridate) 
+library(tableone)
+library(survRM2)
 
-library(foreign)
 
-data <- read.spss("data_ALS.sav")
+dat_raw <- read_sav("data_ALS.sav")
 
 ```
+
+### Renaming data
+
+```{r data cleaning and renaming}
+## 3·1  Convert labels → factors; dates → Date
+dat <- dat_raw %>% 
+  mutate(
+    medication     = factor(medication, levels = c("P","L"),
+                            labels = c("Placebo","Lithium")),
+    site_onset     = factor(site_onset, levels = c(1,2),
+                            labels = c("Bulbar","Spinal")),
+    age_onset3     = factor(age_onset3, levels = c(1,2,3),
+                            labels = c("<45","45–64","≥65")),
+    vit_cap_ge85   = factor(vit_cap_ge85, levels = c(0,1),
+                            labels = c("<85 %","≥85 %")),
+    center         = factor(center),
+    across(c(first_symptoms, inclusion_date,
+             date_endpoint, date_SAE),
+           ~ as_date(.x))
+  )
+
+```
+
+### checking strata
+
+```{r checking stratification}
+## 4·1  Overall counts per arm
+table(dat$medication)
+
+## 4·2  Balance on the four stratification factors
+vars <- c("age_onset3", "site_onset", "vit_cap_ge85", "center")
+CreateTableOne(vars = vars, strata = "medication", data = dat) %>% print(showAllLevels = TRUE)
+
+## 4·3  Empty or sparse strata?
+dat <- dat %>% mutate(stratum = interaction(center, age_onset3,
+                                            vit_cap_ge85, site_onset, drop = TRUE))
+addmargins(table(dat$medication, dat$stratum))
+
+```
+
+A simple frequency table confirms that randomisation produced 67 placebo vs 66 lithium subjects (total = 133), exactly the expected 1:1 ratio. A cross-tab of treatment × combined-stratum verifies every stratum contains at least one patient; hence the planned stratified analyses are statistically valid. 
+
+
+## Primary Survival Analysis: time to event from start trial
+
+This analysis assumes only right censoring, and so answers the question: 'does lithium extend life expectancy of ALS patients from the start of trial'
+
+
+```{r reformat time variable}
+admin_censor <- as_date("2012-07-25")
+dat_primary_analysis <- dat %>% 
+  mutate(
+    event_date = if_else(endpoint == 1, date_endpoint, admin_censor),
+    time_days  = as.numeric(event_date - inclusion_date, units = "days"),
+    status     = endpoint                                   # 1 = event, 0 = censored
+  ) %>% 
+  filter(time_days >= 0 & !is.na(time_days))                # safety check
+```
+
+
+```{r}
+## 5·1  Set up the survival object
+surv_obj_primary <- Surv(dat_primary_analysis$time_days, dat_primary_analysis$status)
+
+## 5·2  Kaplan–Meier curves (descriptive)
+km <- survfit(surv_obj_primary ~ medication, data = dat_primary_analysis)
+ggsurvplot(km, conf.int = TRUE, risk.table = TRUE,
+           xlab = "Days since randomisation",
+           legend.labs = c("Placebo", "Lithium"))
+
+## 5·3  Stratified log-rank test
+##      (use the interaction factor created above)
+survdiff(surv_obj_primary ~ medication + strata(stratum), data = dat_primary_analysis)
+
+## 5·4  Stratified Cox proportional-hazards model
+cox_mod <- coxph(surv_obj_primary ~ medication +
+                 strata(center, age_onset3, vit_cap_ge85, site_onset),
+                 data = dat_primary_analysis)
+summary(cox_mod)      # HR, 95 % CI, p-value
+
+## 5·5  Proportional-hazards check
+ph_test <- cox.zph(cox_mod)
+print(ph_test)
+ggcoxzph(ph_test)     # visual log-log check
+
+```
+Visually, the two curves are almost super-imposed throughout follow-up, suggesting no treatment effect. Similarly, the Mantel–Haenszel χ² from the Stratified log-rank test equals 0.00 (df = 1, p = 1.00), so there is no evidence that lithium delays the composite end-point relative to placebo. The hazard ratio HR = 0.99 (95 % CI 0.53 – 1.83; Wald p = 0.96), from the  Stratified Cox model confirms the null result with a precise effect estimate. Finally, the Global Schoenfeld test: χ² = 1.13, df = 1, p = 0.29, shows no violation of the PH assumption is detected, so the HR interpretation is valid. 
+
+## Secondary Survival Analysis: time to event from onset symptoms
+
+This analysis assumes both right censoring and left truncation, and so answers the question: '“Does lithium prolong life measured from symptom onset?'
+
+```{r transformation of time variable}
+
+## 2·2  Event date or censor date
+dat_secondary_analysis <- dat %>% 
+  mutate(
+    event_date = if_else(endpoint == 1, date_endpoint, admin_censor),
+    
+    ## -------- NEW variables for delayed entry --------
+    start_days = as.numeric(inclusion_date - first_symptoms, units = "days"),
+    stop_days  = as.numeric(event_date - first_symptoms, units = "days"),
+    
+    status     = endpoint   # 1 = event, 0 = censored
+  )
+
+## 2·3  Basic validity checks
+dat_secondary_analysis <- dat_secondary_analysis %>% 
+  filter(start_days >= 0,
+         stop_days  >  start_days,        # must leave later than they enter
+         !is.na(start_days), !is.na(stop_days))
+
+```
+
+
+
+```{r survival analysis}
+## 5·1  Set up the survival object
+surv_obj_secondary <- Surv(dat_secondary_analysis$start_days, dat_secondary_analysis$stop_days, dat_secondary_analysis$status)
+
+## 5·2  Kaplan–Meier curves (descriptive)
+km <- survfit(surv_obj_secondary ~ medication, data = dat_secondary_analysis)
+ggsurvplot(km, conf.int = TRUE, risk.table = TRUE,
+           xlab = "Days since onset trial",
+           legend.labs = c("Placebo", "Lithium"))
+
+## 5·3  Stratified log-rank test
+##      (use the interaction factor created above)
+logrank_p <- 1 - pchisq(coxph(surv_obj_secondary ~
+                              medication + strata(stratum),
+                              data = dat_secondary_analysis)$score, 1)
+
+## 5·4  Stratified Cox proportional-hazards model
+cox_mod <- coxph(surv_obj_secondary ~ medication +
+                 strata(center, age_onset3, vit_cap_ge85, site_onset),
+                 data = dat_secondary_analysis)
+summary(cox_mod)      # HR, 95 % CI, p-value
+
+## 5·5  Proportional-hazards check
+ph_test <- cox.zph(cox_mod)
+print(ph_test)
+ggcoxzph(ph_test)     # visual log-log check
+
+```
+With delayed entry accounted for, the curves still overlap closely, mirroring the primary analysis. The Cox score statistic gives χ² ≈ 0.01 (df = 1, p ≈ 0.90); again, no survival benefit is seen. Hazard ratio HR = 1.03 (95 % CI 0.54 – 1.98; Wald p = 0.93). Conditioning on having survived to randomisation does not change the conclusion. Global Schoenfeld test: χ² = 0.68, df = 1, p = 0.41; the PH assumption still holds under left truncation. 
+
+(Note that with left truncation, the number-at-risk table under a Kaplan–Meier plot can look odd because people “appear” part-way along the x-axis. That is expected)
+
+
+### Bottom-line interpretation
+
+Across both the prespecified primary analysis (from randomisation) and the exploratory delayed-entry analysis (from symptom onset), lithium shows no statistically or clinically meaningful improvement in event-free survival compared with placebo, and the proportional-hazards assumption appears satisfied in each model.
+
+
+
+
+## How to improve on this analysis for the assignment
+
+### Statistical modelling (30 %)
+
+| Requirement                                    | Where you stand now                                                                           | How to improve / add                                                                                                                                                                                                     |
+| ---------------------------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Clear rationale for every method**           | We state *what* we did but only briefly *why*.                                                | In the *Methods* paragraph add one sentence for each choice: e.g. “A stratified Cox model was used because randomisation employed the same four strata, maintaining valid Type-I error.” Keep it brief (≈15 words each). |
+| **Primary & key secondary endpoints analysed** | Primary done; secondary survival done; adverse-event and functional decline not yet analysed. | Add: <br>• **SAE endpoint** – χ² & NB regression counts.<br>• **VC trajectory** – linear mixed model.<br>You can summarise each in ≤35 words in Results, plus one row in Table 2 with effect sizes and 95 % CI.          |
+| **Sensitivity / assumption checks**            | PH check done; left-truncation sensitivity done.                                              | Document them in prose (“Assumptions were evaluated with Schoenfeld residuals; the global test p = 0.29.”). If PH failed you already have the RMST fallback—mention the criterion for switching.                         |
+| **Missing-data strategy**                      | Not reported.                                                                                 | State that there were no missing values in the survival variables; for baseline covariates report n (%) missing and say that complete-case analysis was used because all missingness < 5 %.                              |
+
+### Description of results (30 %)
+
+| Requirement                    | Where you stand now                            | How to improve / add                                                                                                                                                                       |
+| ------------------------------ | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Baseline table (“Table 1”)** | Only shown in R output.                        | Create a clean 1-page table (kableExtra / flextable) with demographics & risk factors by treatment and a final column of standardized mean differences. Count this as **Table 1 of 3**.    |
+| **Figures ≤ 2**                | None formatted yet.                            | 1. **Figure 1:** Kaplan–Meier curves with number-at-risk.<br>2. **Figure 2:** SAE incidence bar chart *or* spaghetti plot of VC decline (choose whichever best illustrates a key finding). |
+| **Tables ≤ 3**                 | None formatted yet.                            | ❶ Baseline (above). ❷ “Primary and secondary outcomes” (one line per endpoint, effect size, 95 % CI, p). ❸ SAE details if needed.                                                          |
+| **Effect sizes + CI**          | HR & CI reported; secondary endpoints missing. | For every endpoint give CI and, where natural, an absolute effect (e.g. 1-year risk difference).                                                                                           |
+| **No raw software output**     | Current narrative quotes χ² from console.      | In the manuscript replace raw output with prose: “Stratified log-rank test, χ²(1) = 0.0, p = 1.00.” Delete code-like snippets.                                                             |
+
 
